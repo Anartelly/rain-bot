@@ -2,12 +2,15 @@ name: Rain Monitor 24/7
 
 on:
   schedule:
-    - cron: '*/5 * * * *' # Проверка каждые 5 минут
+    - cron: '*/5 * * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 concurrency:
   group: rain-monitor
-  cancel-in-progress: false # Не прерывать текущую смену, а ставить следующую в очередь
+  cancel-in-progress: false
 
 jobs:
   monitor:
