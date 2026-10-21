@@ -26,7 +26,6 @@ def log(msg: str):
 
 def send_tg(text: str):
     if not CHAT_ID:
-        log(f"[TG] CHAT_ID не найден, сообщение пропущено: {text}")
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text}).encode("utf-8")
@@ -38,7 +37,6 @@ def send_tg(text: str):
 
 
 def send_photo_bytes_tg(image_bytes: bytes, caption: str):
-    """Отправляет картинку из памяти напрямую в Telegram."""
     if not CHAT_ID or not image_bytes:
         return
     boundary = uuid.uuid4().hex
@@ -58,13 +56,11 @@ def send_photo_bytes_tg(image_bytes: bytes, caption: str):
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     try:
         urllib.request.urlopen(req, timeout=20)
-        log(f"[TG] Скриншот отправлен: {caption}")
     except Exception as e:
         log(f"[TG] Ошибка отправки фото ({caption}): {e}")
 
 
 async def fast_screenshot(page) -> bytes:
-    """Мгновенный скриншот через протокол Chrome (не зависает на шрифтах и анимациях)."""
     try:
         cdp = await page.context.new_cdp_session(page)
         res = await cdp.send("Page.captureScreenshot", {"format": "jpeg", "quality": 80})
@@ -76,11 +72,13 @@ async def fast_screenshot(page) -> bytes:
 
 
 async def send_status_and_screenshots(pages: dict, header: str):
-    """Отправляет текстовый отчет и скриншоты обоих сайтов."""
     send_tg(
         f"{header}\n\n"
         f"📊 RustMagic:\n{widget_state['rustmagic']}\n\n"
-        f"📊 Bandit.camp:\n{widget_state['bandit']}"
+        f"📊 Bandit.camp:\n{widget_state['bandit']}\n\n"
+        f"💡 Команды:\n"
+        f"• Напиши «клик» — нажать на галочку на Bandit.camp\n"
+        f"• Напиши «клик X Y» (например: клик 532 316) — кликнуть по координатам"
     )
     for key, page in pages.items():
         img = await fast_screenshot(page)
@@ -88,8 +86,38 @@ async def send_status_and_screenshots(pages: dict, header: str):
             send_photo_bytes_tg(img, f"Экран: {key}")
 
 
+async def click_on_bandit(page, custom_coords=None):
+    """Выполняет клик мышкой на странице bandit.camp по галочке или заданным координатам."""
+    try:
+        x, y = 532, 316  # Координаты галочки по умолчанию для экрана 1920x1080
+
+        if custom_coords:
+            x, y = custom_coords
+        else:
+            # Пытаемся найти точное положение блока проверки на странице
+            for frame in page.frames:
+                if "cloudflare" in frame.url or "turnstile" in frame.url:
+                    el = await frame.frame_element()
+                    box = await el.bounding_box()
+                    if box:
+                        x = int(box["x"] + 28)
+                        y = int(box["y"] + box["height"] / 2)
+                        break
+
+        await page.mouse.move(x, y, steps=10)
+        await asyncio.sleep(0.2)
+        await page.mouse.click(x, y)
+        send_tg(f"🖱 Выполнен клик на Bandit.camp в точке ({x}, {y}). Жду 5 секунд и делаю скриншот...")
+        await asyncio.sleep(5)
+
+        img = await fast_screenshot(page)
+        if img:
+            send_photo_bytes_tg(img, f"Bandit.camp после клика ({x}, {y})")
+    except Exception as e:
+        send_tg(f"⚠️ Ошибка при клике: {e}")
+
+
 def init_chat_id():
-    """Находит CHAT_ID из истории сообщений при старте без ложной рассылки."""
     global CHAT_ID, last_update_id
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     try:
@@ -105,7 +133,6 @@ def init_chat_id():
 
 
 async def check_telegram_updates(pages: dict):
-    """Проверяет новые сообщения от пользователя во время работы цикла."""
     global CHAT_ID, last_update_id
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={last_update_id + 1}"
     try:
@@ -116,7 +143,17 @@ async def check_telegram_updates(pages: dict):
                 msg = item.get("message") or item.get("edited_message")
                 if msg and "chat" in msg:
                     CHAT_ID = msg["chat"]["id"]
-                    if (msg.get("text") or "").strip():
+                    text = (msg.get("text") or "").strip().lower()
+                    if not text:
+                        continue
+
+                    if text.startswith("клик") or text.startswith("click"):
+                        nums = re.findall(r'\d+', text)
+                        if len(nums) >= 2:
+                            await click_on_bandit(pages["bandit"], (int(nums[0]), int(nums[1])))
+                        else:
+                            await click_on_bandit(pages["bandit"])
+                    else:
                         await send_status_and_screenshots(pages, "🟢 Бот работает (опрос каждую 1 сек)!")
     except Exception:
         pass
@@ -220,7 +257,7 @@ async def check_bandit(page):
                     }
                 }
             }
-            return { state: "Виджет Rain не виден (проверь скриншот)", active: false, text: "" };
+            return { state: "Ожидание входа на сайт (проверь скриншот)", active: false, text: "" };
         }""")
 
         widget_state["bandit"] = info["state"]
@@ -253,16 +290,13 @@ async def main():
                 log(f"[{key}] Открываю {url}...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 await asyncio.sleep(10)
-                log(f"[{key}] Заголовок: {await page.title()}")
             except Exception as e:
                 log(f"[{key}] Ошибка: {e}")
             pages[key] = page
 
-        # Первая проверка виджетов после загрузки страниц
         await check_rustmagic(pages["rustmagic"])
         await check_bandit(pages["bandit"])
 
-        # Автоматически шлем отчет и скриншоты при старте!
         await send_status_and_screenshots(pages, "✅ Сайты загружены! Начинаю мониторинг (1 сек):")
 
         loop_count = 0
