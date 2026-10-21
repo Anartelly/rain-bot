@@ -299,4 +299,159 @@ async def check_telegram_updates(context, main_page):
                     page = get_active_page(context)
                     send_tg(
                         f"🟢 Бот на связи!\n"
-                        f"📊 Ви
+                        f"📊 Виджет: {widget_state}\n\n"
+                        f"Команды:\n"
+                        f"• вход — начать вход в аккаунт\n"
+                        f"• логин ЛОГИН ПАРОЛЬ — ввести данные\n"
+                        f"• код XXXXX — ввести код с почты\n"
+                        f"• клик X Y — нажать мышкой в точку (X, Y)"
+                    )
+                    await send_screen(page, "Текущий экран")
+    except Exception:
+        pass
+
+
+def extract_amount(text: str) -> str:
+    clean = re.sub(r'\b\d{1,2}:\d{2}\b', '', text)
+    clean = re.sub(r'\b\d+\s*(?:min|sec|m|s|h|hour)[a-z]*\s*ago\b', '', clean, flags=re.IGNORECASE)
+    matches = re.findall(r'\b\d+[.,]\d{2}\b', clean)
+    if matches:
+        return matches[0].replace(",", ".")
+    return "???"
+
+
+def trigger_rain(amount: str):
+    global last_alert
+    now = time.time()
+    if now - last_alert < COOLDOWN:
+        return
+    last_alert = now
+    msg = f"Rust magic rain: {amount} coins"
+    log(f"🔥 НАЧАЛСЯ РЕЙН: {msg}")
+    send_tg(msg)
+
+
+async def check_rustmagic(page):
+    global widget_state
+    try:
+        info = await page.evaluate("""() => {
+            const blocks = Array.from(document.querySelectorAll('div, section, aside'));
+
+            // 1. Ищем активный рейн ("It's Raining!" или кнопку "Join Rain" / "Joined")
+            let activeMatches = [];
+            for (const el of blocks) {
+                const t = (el.innerText || '').trim();
+                const low = t.toLowerCase();
+                if (t.length > 5 && t.length < 180) {
+                    const isRainActive = low.includes("it's raining") || low.includes("its raining") || low.includes("join rain");
+                    if (isRainActive && /\\d+[.,]\\d{2}/.test(t)) {
+                        activeMatches.push(t);
+                    }
+                }
+            }
+
+            if (activeMatches.length > 0) {
+                activeMatches.sort((a, b) => a.length - b.length);
+                const best = activeMatches[0];
+                return {
+                    state: "🔥 ИДЕТ РЕЙН: " + best.replace(/\\n+/g, ' | '),
+                    active: true,
+                    text: best
+                };
+            }
+
+            // 2. Ищем режим ожидания ("Coin Rain")
+            let idleMatches = [];
+            for (const el of blocks) {
+                const t = (el.innerText || '').trim();
+                const low = t.toLowerCase();
+                if (t.length > 5 && t.length < 180 && low.includes("coin rain")) {
+                    idleMatches.push(t);
+                }
+            }
+
+            if (idleMatches.length > 0) {
+                idleMatches.sort((a, b) => a.length - b.length);
+                return {
+                    state: "Ожидание: " + idleMatches[0].replace(/\\n+/g, ' | '),
+                    active: false,
+                    text: idleMatches[0]
+                };
+            }
+
+            return { state: "Виджет не виден на экране", active: false, text: "" };
+        }""")
+
+        widget_state = info["state"]
+        if info["active"]:
+            amount = extract_amount(info["text"])
+            trigger_rain(amount)
+    except Exception as e:
+        widget_state = f"Ошибка: {e}"
+
+
+async def is_logged_in(page) -> bool:
+    """Проверяет, есть ли на странице кнопка Sign In (если нет — значит уже вошли)."""
+    try:
+        has_sign_in = await page.evaluate("""() => {
+            const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            return btns.some(b => (b.innerText || '').trim().toLowerCase() === 'sign in');
+        }""")
+        return not has_sign_in
+    except Exception:
+        return False
+
+
+async def main():
+    init_chat_id()
+    log(f"Запуск мониторинга RustMagic. CHAT_ID: {CHAT_ID}")
+
+    start_time = time.time()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--window-size=1920,1080"]
+        )
+
+        # Если уже есть сохраненная сессия — подгружаем её
+        context_kwargs = {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "viewport": {"width": 1920, "height": 1080}
+        }
+        if os.path.exists(SESSION_FILE):
+            log("Загружаю сохраненную сессию из session.json...")
+            context_kwargs["storage_state"] = SESSION_FILE
+
+        context = await browser.new_context(**context_kwargs)
+        page = await context.new_page()
+
+        try:
+            log("Открываю https://rustmagic.com...")
+            await page.goto("https://rustmagic.com", wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(10)
+        except Exception as e:
+            log(f"Ошибка загрузки: {e}")
+
+        await check_rustmagic(page)
+
+        # Проверяем, вошли ли мы в аккаунт
+        if await is_logged_in(page):
+            await send_screen(page, f"✅ Сайт открыт (вход в аккаунт уже выполнен)!\n📊 {widget_state}")
+        else:
+            send_tg("🔓 Ты еще не вошел в аккаунт на RustMagic. Запускаю процедуру входа...")
+            await start_login_process(context, page)
+
+        loop_count = 0
+        while time.time() - start_time < RUN_DURATION:
+            await check_rustmagic(page)
+
+            loop_count += 1
+            if loop_count % 2 == 0:
+                await check_telegram_updates(context, page)
+
+            await asyncio.sleep(1)
+
+        await browser.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
