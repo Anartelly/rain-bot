@@ -20,7 +20,7 @@ last_alert = 0
 widget_state = "Загрузка..."
 CHAT_ID = None
 last_update_id = 0
-auth_stage = "IDLE"  # IDLE, WAIT_LOGIN, WAIT_CODE, DONE
+auth_stage = "IDLE"
 
 
 def log(msg: str):
@@ -64,7 +64,6 @@ def send_photo_bytes_tg(image_bytes: bytes, caption: str):
 
 
 def get_active_page(context):
-    """Возвращает последнюю открытую вкладку (если открылось окно входа Steam)."""
     pages = context.pages
     return pages[-1] if pages else None
 
@@ -96,17 +95,16 @@ async def save_session_to_github(context):
         subprocess.run(["git", "commit", "-m", "Save login session"], check=False)
         subprocess.run(["git", "push"], check=False)
         log("Сессия успешно сохранена в session.json")
+        send_tg("💾 Сессия сохранена в репозиторий (session.json)!")
     except Exception as e:
         log(f"Ошибка сохранения сессии: {e}")
 
 
 async def start_login_process(context, main_page):
-    """Нажимает Sign In на RustMagic и открывает форму входа."""
     global auth_stage
     try:
         send_tg("🔐 Нажимаю кнопку Sign In на сайте...")
-        # Ищем кнопку Sign In
-        clicked = await main_page.evaluate("""() => {
+        await main_page.evaluate("""() => {
             const btns = Array.from(document.querySelectorAll('button, a, [role="button"], div'));
             for (const b of btns) {
                 const t = (b.innerText || '').trim().toLowerCase();
@@ -120,7 +118,6 @@ async def start_login_process(context, main_page):
 
         await asyncio.sleep(4)
 
-        # Если появилось окно с галочками (18+ / Terms) и кнопкой Steam — ставим галочки и жмем
         await main_page.evaluate("""() => {
             const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"], [role="checkbox"]'));
             checkboxes.forEach(cb => { if (!cb.checked) cb.click(); });
@@ -140,39 +137,31 @@ async def start_login_process(context, main_page):
         auth_stage = "WAIT_LOGIN"
         await send_screen(
             active_page,
-            "🔑 Шаг 1: Отправь боту логин и пароль через пробел:\n"
+            "🔑 Шаг 1: Отправь логин и пароль:\n"
             "логин ТВОЙ_ЛОГИН ТВОЙ_ПАРОЛЬ\n\n"
-            "(Если на экране нужно куда-то нажать вручную, напиши: клик X Y)"
+            "Или вручную: клик X Y ТЕКСТ"
         )
     except Exception as e:
         send_tg(f"⚠️ Ошибка при открытии входа: {e}")
 
 
 async def submit_credentials(context, username: str, password: str):
-    """Вводит логин и пароль на странице авторизации."""
     global auth_stage
     page = get_active_page(context)
     try:
         send_tg("⏳ Ввожу логин и пароль...")
-        # Заполняем текстовое поле (логин) и поле пароля
         text_inputs = page.locator('input[type="text"]:visible, input[type="email"]:visible')
         pass_inputs = page.locator('input[type="password"]:visible')
 
         if await text_inputs.count() > 0 and await pass_inputs.count() > 0:
-            await text_inputs.first.click()
+            await text_inputs.first.click(timeout=5000)
             await text_inputs.first.fill(username)
-            await asyncio.sleep(0.5)
-            await pass_inputs.first.click()
+            await asyncio.sleep(0.4)
+            await pass_inputs.first.click(timeout=5000)
             await pass_inputs.first.fill(password)
-            await asyncio.sleep(0.5)
-
-            submit_btn = page.locator('button[type="submit"]:visible, input[type="submit"]:visible')
-            if await submit_btn.count() > 0:
-                await submit_btn.first.click()
-            else:
-                await page.keyboard.press("Enter")
+            await asyncio.sleep(0.4)
+            await page.keyboard.press("Enter")
         else:
-            # Резервный ввод через клавиатуру
             await page.keyboard.type(username, delay=80)
             await page.keyboard.press("Tab")
             await page.keyboard.type(password, delay=80)
@@ -182,24 +171,28 @@ async def submit_credentials(context, username: str, password: str):
         auth_stage = "WAIT_CODE"
         await send_screen(
             get_active_page(context),
-            "📩 Шаг 2: Проверь почту (или Steam Guard) и отправь код в формате:\n"
-            "код XXXXX"
+            "📩 Шаг 2: Отправь 5-значный код с почты/Steam:\n"
+            "код XXXXX\n\n"
+            "(Либо кликни в ячейку вручную: клик X Y XXXXX)"
         )
     except Exception as e:
         send_tg(f"⚠️ Ошибка ввода логина/пароля: {e}")
+        await send_screen(page, "Экран после ошибки")
 
 
 async def submit_guard_code(context, main_page, code: str):
-    """Вводит 5-значный код с почты / Steam Guard и завершает вход."""
+    """Вводит код без зависания на скрытых кнопках Steam."""
     global auth_stage
     page = get_active_page(context)
     try:
-        send_tg(f"⏳ Ввожу код подтверждения: {code}...")
-        # Фокусируемся на первом поле ввода кода (в новом интерфейсе Steam 5 отдельных ячеек)
-        code_inputs = page.locator('input[type="text"]:visible, input[maxlength="1"]:visible, input:not([type="hidden"]):visible')
-        if await code_inputs.count() > 0:
-            await code_inputs.first.click()
-            await asyncio.sleep(0.3)
+        send_tg(f"⏳ Печатаю код: {code}...")
+        # Ставим фокус в первое видимое текстовое поле через JS (мгновенно, без таймаутов)
+        await page.evaluate("""() => {
+            const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="password"]):not([type="checkbox"])'))
+                .filter(el => el.offsetParent !== null);
+            if (inputs.length > 0) inputs[0].focus();
+        }""")
+        await asyncio.sleep(0.3)
 
         await page.keyboard.type(code, delay=150)
         await asyncio.sleep(1)
@@ -207,22 +200,31 @@ async def submit_guard_code(context, main_page, code: str):
 
         await asyncio.sleep(6)
 
-        # Если открылась страница подтверждения OpenID (кнопка "Войти" / "Sign In" на сайте Steam)
+        # Если открылось окно OpenID (кнопка #imageLogin "Войти" в Steam) — жмем через JS без ожидания
         page = get_active_page(context)
         if "steamcommunity.com" in page.url:
-            openid_btn = page.locator('#imageLogin, input[type="submit"], button[type="submit"]')
-            if await openid_btn.count() > 0:
-                await openid_btn.first.click()
+            clicked = await page.evaluate("""() => {
+                const btn = document.querySelector('#imageLogin') ||
+                    Array.from(document.querySelectorAll('input[type="submit"], button[type="submit"]'))
+                        .find(el => el.offsetParent !== null);
+                if (btn) {
+                    btn.click();
+                    return true;
+                }
+                return false;
+            }""")
+            if clicked:
                 await asyncio.sleep(6)
 
         auth_stage = "DONE"
         await save_session_to_github(context)
         await send_screen(
-            main_page,
-            "✅ Код введен, сессия сохранена! Теперь бот следит за Rain из твоего аккаунта."
+            get_active_page(context),
+            "✅ Готово! Проверь по скриншоту, вошел ли бот на сайт."
         )
     except Exception as e:
         send_tg(f"⚠️ Ошибка при вводе кода: {e}")
+        await send_screen(get_active_page(context), "Текущий экран")
 
 
 def init_chat_id():
@@ -257,54 +259,76 @@ async def check_telegram_updates(context, main_page):
                 if not raw_text:
                     continue
                 low_text = raw_text.lower()
+                page = get_active_page(context)
 
-                # 1. Команда старта входа
+                # 1. Начать вход
                 if low_text in ["вход", "войти", "/login", "login"]:
                     await start_login_process(context, main_page)
 
-                # 2. Ввод логина и пароля: "логин mylogin mypass"
+                # 2. Логин и пароль
                 elif low_text.startswith("логин ") or low_text.startswith("login "):
                     parts = raw_text.split(maxsplit=2)
                     if len(parts) >= 3:
                         await submit_credentials(context, parts[1], parts[2])
                     else:
-                        send_tg("⚠️ Напиши через пробел: логин ТВОЙ_ЛОГИН ТВОЙ_ПАРОЛЬ")
+                        send_tg("⚠️ Формат: логин ТВОЙ_ЛОГИН ТВОЙ_ПАРОЛЬ")
 
-                # 3. Ввод кода с почты: "код A1B2C"
+                # 3. Код с почты
                 elif low_text.startswith("код ") or low_text.startswith("code "):
                     parts = raw_text.split(maxsplit=1)
                     if len(parts) >= 2:
                         await submit_guard_code(context, main_page, parts[1].strip())
-                    else:
-                        send_tg("⚠️ Напиши через пробел: код XXXXX")
 
-                # 4. Если бот уже ждет код и прислали ровно 5 символов без слова "код"
+                # 4. Авто-распознавание 5-значного кода
                 elif auth_stage == "WAIT_CODE" and len(raw_text) == 5 and " " not in raw_text:
                     await submit_guard_code(context, main_page, raw_text)
 
-                # 5. Ручной клик по координатам: "клик X Y"
-                elif low_text.startswith("клик") or low_text.startswith("click"):
-                    nums = re.findall(r'\d+', raw_text)
-                    page = get_active_page(context)
-                    if len(nums) >= 2:
-                        x, y = int(nums[0]), int(nums[1])
-                        await page.mouse.click(x, y)
-                        await asyncio.sleep(4)
-                        await send_screen(page, f"🖱 Клик в точке ({x}, {y})")
-                    else:
-                        send_tg("⚠️ Укажи координаты, например: клик 1850 60")
+                # 5. Ручной ввод с клавиатуры: "ввод ТЕКСТ"
+                elif low_text.startswith("ввод ") or low_text.startswith("type "):
+                    txt = raw_text.split(maxsplit=1)[1]
+                    await page.keyboard.type(txt, delay=120)
+                    await asyncio.sleep(0.5)
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(4)
+                    await send_screen(get_active_page(context), f"⌨️ Введен текст: {txt}")
 
-                # 6. Любое другое сообщение — показать текущий статус и скриншот
+                # 6. Нажатие Enter
+                elif low_text in ["энтер", "enter"]:
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(4)
+                    await send_screen(get_active_page(context), "⌨️ Нажат Enter")
+
+                # 7. Принудительное сохранение сессии
+                elif low_text in ["сохранить", "save"]:
+                    await save_session_to_github(context)
+                    await send_screen(get_active_page(context), "Экран при сохранении")
+
+                # 8. Клик по координатам (с возможным вводом текста): "клик X Y" или "клик X Y ТЕКСТ"
+                elif low_text.startswith("клик") or low_text.startswith("click"):
+                    parts = raw_text.split(maxsplit=3)
+                    if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                        x, y = int(parts[1]), int(parts[2])
+                        await page.mouse.click(x, y)
+                        await asyncio.sleep(0.5)
+                        if len(parts) == 4:
+                            await page.keyboard.type(parts[3], delay=120)
+                            await asyncio.sleep(0.5)
+                            await page.keyboard.press("Enter")
+                        await asyncio.sleep(4)
+                        await send_screen(get_active_page(context), f"🖱 Клик ({x}, {y})")
+                    else:
+                        send_tg("⚠️ Формат: клик X Y  или  клик X Y ТЕКСТ")
+
+                # 9. Любое другое сообщение — статус и скриншот
                 else:
-                    page = get_active_page(context)
                     send_tg(
                         f"🟢 Бот на связи!\n"
                         f"📊 Виджет: {widget_state}\n\n"
-                        f"Команды:\n"
-                        f"• вход — начать вход в аккаунт\n"
-                        f"• логин ЛОГИН ПАРОЛЬ — ввести данные\n"
-                        f"• код XXXXX — ввести код с почты\n"
-                        f"• клик X Y — нажать мышкой в точку (X, Y)"
+                        f"Ручное управление:\n"
+                        f"• клик X Y — нажать мышкой\n"
+                        f"• клик X Y ТЕКСТ — нажать и вписать текст\n"
+                        f"• ввод ТЕКСТ — просто напечатать по буквам + Enter\n"
+                        f"• сохранить — сохранить вход в GitHub"
                     )
                     await send_screen(page, "Текущий экран")
     except Exception:
@@ -337,7 +361,6 @@ async def check_rustmagic(page):
         info = await page.evaluate("""() => {
             const blocks = Array.from(document.querySelectorAll('div, section, aside'));
 
-            // 1. Ищем активный рейн ("It's Raining!" или кнопку "Join Rain" / "Joined")
             let activeMatches = [];
             for (const el of blocks) {
                 const t = (el.innerText || '').trim();
@@ -360,7 +383,6 @@ async def check_rustmagic(page):
                 };
             }
 
-            // 2. Ищем режим ожидания ("Coin Rain")
             let idleMatches = [];
             for (const el of blocks) {
                 const t = (el.innerText || '').trim();
@@ -391,7 +413,6 @@ async def check_rustmagic(page):
 
 
 async def is_logged_in(page) -> bool:
-    """Проверяет, есть ли на странице кнопка Sign In (если нет — значит уже вошли)."""
     try:
         has_sign_in = await page.evaluate("""() => {
             const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
@@ -413,7 +434,6 @@ async def main():
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--window-size=1920,1080"]
         )
 
-        # Если уже есть сохраненная сессия — подгружаем её
         context_kwargs = {
             "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             "viewport": {"width": 1920, "height": 1080}
@@ -434,11 +454,10 @@ async def main():
 
         await check_rustmagic(page)
 
-        # Проверяем, вошли ли мы в аккаунт
         if await is_logged_in(page):
-            await send_screen(page, f"✅ Сайт открыт (вход в аккаунт уже выполнен)!\n📊 {widget_state}")
+            await send_screen(page, f"✅ Сайт открыт (вход уже выполнен)!\n📊 {widget_state}")
         else:
-            send_tg("🔓 Ты еще не вошел в аккаунт на RustMagic. Запускаю процедуру входа...")
+            send_tg("🔓 Вход еще не выполнен. Начинаю авторизацию...")
             await start_login_process(context, page)
 
         loop_count = 0
