@@ -14,7 +14,7 @@ BOT_TOKEN = "8935522730:AAH2sDOqtf4kCk_-YWaW1Npz0IDtjgRYqOM"
 SESSION_FILE = "session.json"
 
 RUN_DURATION = 52 * 60  # 52 минуты работы одной смены
-COOLDOWN = 210          # 3.5 минуты паузы после уведомления, чтобы не слать дважды за один рейн
+COOLDOWN = 210          # 3.5 минуты паузы после уведомления, чтобы не дублировать один и тот же рейн
 
 last_alert = 0
 widget_state = "Загрузка..."
@@ -28,7 +28,7 @@ def log(msg: str):
     print(msg, flush=True)
 
 
-def send_tg(text: str):
+def _send_tg_sync(text: str):
     if not CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -40,7 +40,11 @@ def send_tg(text: str):
         log(f"[TG] Ошибка отправки текста: {e}")
 
 
-def send_photo_bytes_tg(image_bytes: bytes, caption: str):
+async def send_tg(text: str):
+    await asyncio.to_thread(_send_tg_sync, text)
+
+
+def _send_photo_sync(image_bytes: bytes, caption: str):
     if not CHAT_ID or not image_bytes:
         return
     boundary = uuid.uuid4().hex
@@ -64,14 +68,16 @@ def send_photo_bytes_tg(image_bytes: bytes, caption: str):
         log(f"[TG] Ошибка отправки фото: {e}")
 
 
+async def send_photo_bytes_tg(image_bytes: bytes, caption: str):
+    await asyncio.to_thread(_send_photo_sync, image_bytes, caption)
+
+
 def get_active_page(context):
-    """Всегда возвращает актуальную открытую вкладку."""
     pages = [p for p in context.pages if not p.is_closed()]
     return pages[-1] if pages else None
 
 
 def get_rustmagic_page(context, fallback_page):
-    """Возвращает последнюю вкладку, где открыт rustmagic.com."""
     pages = [p for p in context.pages if not p.is_closed() and "rustmagic.com" in p.url]
     if pages:
         return pages[-1]
@@ -93,11 +99,10 @@ async def fast_screenshot(page) -> bytes:
 async def send_screen(page, caption: str):
     img = await fast_screenshot(page)
     if img:
-        send_photo_bytes_tg(img, caption)
+        await send_photo_bytes_tg(img, caption)
 
 
 async def save_session_to_github(context, notify=True):
-    """Сохраняет куки входа в репозиторий, чтобы не вводить код при перезапусках."""
     global session_saved_this_run
     try:
         await context.storage_state(path=SESSION_FILE)
@@ -109,7 +114,7 @@ async def save_session_to_github(context, notify=True):
         session_saved_this_run = True
         log("Сессия успешно сохранена в session.json")
         if notify:
-            send_tg("💾 Сессия аккаунта сохранена в GitHub (session.json)!")
+            await send_tg("💾 Сессия аккаунта сохранена в GitHub (session.json)!")
     except Exception as e:
         log(f"Ошибка сохранения сессии: {e}")
 
@@ -118,7 +123,7 @@ async def start_login_process(context, main_page):
     global auth_stage
     page = get_rustmagic_page(context, main_page)
     try:
-        send_tg("🔐 Нажимаю кнопку Sign In на сайте...")
+        await send_tg("🔐 Нажимаю кнопку Sign In на сайте...")
         await page.evaluate("""() => {
             const btns = Array.from(document.querySelectorAll('button, a, [role="button"], div'));
             for (const b of btns) {
@@ -157,14 +162,14 @@ async def start_login_process(context, main_page):
             "Или вручную: клик X Y ТЕКСТ"
         )
     except Exception as e:
-        send_tg(f"⚠️ Ошибка при открытии входа: {e}")
+        await send_tg(f"⚠️ Ошибка при открытии входа: {e}")
 
 
 async def submit_credentials(context, username: str, password: str):
     global auth_stage
     page = get_active_page(context)
     try:
-        send_tg("⏳ Ввожу логин и пароль...")
+        await send_tg("⏳ Ввожу логин и пароль...")
         text_inputs = page.locator('input[type="text"]:visible, input[type="email"]:visible')
         pass_inputs = page.locator('input[type="password"]:visible')
 
@@ -191,7 +196,7 @@ async def submit_credentials(context, username: str, password: str):
             "(Либо кликни вручную: клик X Y XXXXX)"
         )
     except Exception as e:
-        send_tg(f"⚠️ Ошибка ввода логина/пароля: {e}")
+        await send_tg(f"⚠️ Ошибка ввода логина/пароля: {e}")
         await send_screen(page, "Экран после ошибки")
 
 
@@ -199,7 +204,7 @@ async def submit_guard_code(context, main_page, code: str):
     global auth_stage
     page = get_active_page(context)
     try:
-        send_tg(f"⏳ Печатаю код: {code}...")
+        await send_tg(f"⏳ Печатаю код: {code}...")
         await page.evaluate("""() => {
             const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="password"]):not([type="checkbox"])'))
                 .filter(el => el.offsetParent !== null);
@@ -230,12 +235,14 @@ async def submit_guard_code(context, main_page, code: str):
 
         auth_stage = "DONE"
         await save_session_to_github(context, notify=True)
+        rm_page = get_rustmagic_page(context, main_page)
+        await rm_page.bring_to_front()
         await send_screen(
-            get_active_page(context),
-            "✅ Вход выполнен и сохранен! Мониторинг Rain работает."
+            rm_page,
+            "✅ Вход выполнен и сохранен! Мониторинг Rain работает без задержек."
         )
     except Exception as e:
-        send_tg(f"⚠️ Ошибка при вводе кода: {e}")
+        await send_tg(f"⚠️ Ошибка при вводе кода: {e}")
         await send_screen(get_active_page(context), "Текущий экран")
 
 
@@ -254,124 +261,124 @@ def init_chat_id():
         log(f"Ошибка init_chat_id: {e}")
 
 
+def _fetch_updates_sync(offset: int):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}"
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8")).get("result", [])
+
+
 async def check_telegram_updates(context, main_page):
     global CHAT_ID, last_update_id
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={last_update_id + 1}"
     try:
-        with urllib.request.urlopen(urllib.request.Request(url), timeout=8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            for item in data.get("result", []):
-                last_update_id = item["update_id"]
-                msg = item.get("message") or item.get("edited_message")
-                if not msg or "chat" not in msg:
-                    continue
+        results = await asyncio.to_thread(_fetch_updates_sync, last_update_id + 1)
+        for item in results:
+            last_update_id = item["update_id"]
+            msg = item.get("message") or item.get("edited_message")
+            if not msg or "chat" not in msg:
+                continue
 
-                CHAT_ID = msg["chat"]["id"]
-                raw_text = (msg.get("text") or "").strip()
-                if not raw_text:
-                    continue
-                low_text = raw_text.lower()
-                page = get_active_page(context)
+            CHAT_ID = msg["chat"]["id"]
+            raw_text = (msg.get("text") or "").strip()
+            if not raw_text:
+                continue
+            low_text = raw_text.lower()
+            page = get_active_page(context)
 
-                if low_text in ["вход", "войти", "/login", "login"]:
-                    await start_login_process(context, main_page)
+            if low_text in ["вход", "войти", "/login", "login"]:
+                await start_login_process(context, main_page)
 
-                elif low_text.startswith("логин ") or low_text.startswith("login "):
-                    parts = raw_text.split(maxsplit=2)
-                    if len(parts) >= 3:
-                        await submit_credentials(context, parts[1], parts[2])
-                    else:
-                        send_tg("⚠️ Формат: логин ТВОЙ_ЛОГИН ТВОЙ_ПАРОЛЬ")
-
-                elif low_text.startswith("код ") or low_text.startswith("code "):
-                    parts = raw_text.split(maxsplit=1)
-                    if len(parts) >= 2:
-                        await submit_guard_code(context, main_page, parts[1].strip())
-
-                elif auth_stage == "WAIT_CODE" and len(raw_text) == 5 and " " not in raw_text:
-                    await submit_guard_code(context, main_page, raw_text)
-
-                elif low_text.startswith("ввод ") or low_text.startswith("type "):
-                    txt = raw_text.split(maxsplit=1)[1]
-                    await page.keyboard.type(txt, delay=120)
-                    await asyncio.sleep(0.5)
-                    await page.keyboard.press("Enter")
-                    await asyncio.sleep(4)
-                    await send_screen(get_active_page(context), f"⌨️ Введен текст: {txt}")
-
-                elif low_text in ["энтер", "enter"]:
-                    await page.keyboard.press("Enter")
-                    await asyncio.sleep(4)
-                    await send_screen(get_active_page(context), "⌨️ Нажат Enter")
-
-                elif low_text in ["сохранить", "save"]:
-                    await save_session_to_github(context, notify=True)
-                    await send_screen(get_active_page(context), "Экран при сохранении")
-
-                elif low_text.startswith("клик") or low_text.startswith("click"):
-                    parts = raw_text.split(maxsplit=3)
-                    if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
-                        x, y = int(parts[1]), int(parts[2])
-                        await page.mouse.click(x, y)
-                        await asyncio.sleep(0.5)
-                        if len(parts) == 4:
-                            await page.keyboard.type(parts[3], delay=120)
-                            await asyncio.sleep(0.5)
-                            await page.keyboard.press("Enter")
-                        await asyncio.sleep(4)
-                        await send_screen(get_active_page(context), f"🖱 Клик ({x}, {y})")
-                    else:
-                        send_tg("⚠️ Формат: клик X Y  или  клик X Y ТЕКСТ")
-
+            elif low_text.startswith("логин ") or low_text.startswith("login "):
+                parts = raw_text.split(maxsplit=2)
+                if len(parts) >= 3:
+                    await submit_credentials(context, parts[1], parts[2])
                 else:
-                    send_tg(
-                        f"🟢 Бот на связи!\n"
-                        f"📊 Виджет: {widget_state}\n\n"
-                        f"Команды:\n"
-                        f"• клик X Y — нажать мышкой\n"
-                        f"• клик X Y ТЕКСТ — нажать и вписать текст\n"
-                        f"• ввод ТЕКСТ — напечатать по буквам + Enter\n"
-                        f"• сохранить — сохранить вход в GitHub"
-                    )
-                    await send_screen(page, "Текущий экран")
+                    await send_tg("⚠️ Формат: логин ТВОЙ_ЛОГИН ТВОЙ_ПАРОЛЬ")
+
+            elif low_text.startswith("код ") or low_text.startswith("code "):
+                parts = raw_text.split(maxsplit=1)
+                if len(parts) >= 2:
+                    await submit_guard_code(context, main_page, parts[1].strip())
+
+            elif auth_stage == "WAIT_CODE" and len(raw_text) == 5 and " " not in raw_text:
+                await submit_guard_code(context, main_page, raw_text)
+
+            elif low_text.startswith("ввод ") or low_text.startswith("type "):
+                txt = raw_text.split(maxsplit=1)[1]
+                await page.keyboard.type(txt, delay=120)
+                await asyncio.sleep(0.5)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(4)
+                await send_screen(get_active_page(context), f"⌨️ Введен текст: {txt}")
+
+            elif low_text in ["энтер", "enter"]:
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(4)
+                await send_screen(get_active_page(context), "⌨️ Нажат Enter")
+
+            elif low_text in ["сохранить", "save"]:
+                await save_session_to_github(context, notify=True)
+                await send_screen(get_active_page(context), "Экран при сохранении")
+
+            elif low_text.startswith("клик") or low_text.startswith("click"):
+                parts = raw_text.split(maxsplit=3)
+                if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                    x, y = int(parts[1]), int(parts[2])
+                    await page.mouse.click(x, y)
+                    await asyncio.sleep(0.5)
+                    if len(parts) == 4:
+                        await page.keyboard.type(parts[3], delay=120)
+                        await asyncio.sleep(0.5)
+                        await page.keyboard.press("Enter")
+                    await asyncio.sleep(4)
+                    await send_screen(get_active_page(context), f"🖱 Клик ({x}, {y})")
+                else:
+                    await send_tg("⚠️ Формат: клик X Y  или  клик X Y ТЕКСТ")
+
+            else:
+                await send_tg(
+                    f"🟢 Бот на связи (опрос каждые 0.3 сек)!\n"
+                    f"📊 Виджет: {widget_state}\n\n"
+                    f"Команды:\n"
+                    f"• клик X Y — нажать мышкой\n"
+                    f"• клик X Y ТЕКСТ — нажать и вписать текст\n"
+                    f"• ввод ТЕКСТ — напечатать по буквам + Enter\n"
+                    f"• сохранить — сохранить вход в GitHub"
+                )
+                await send_screen(page, "Текущий экран")
     except Exception:
         pass
 
 
 def extract_amount(text: str) -> str:
-    # 1. Убираем таймер вида "02:17" и строки "27 min ago"
     clean = re.sub(r'\b\d{1,2}\s*:\s*\d{2}\b', ' ', text)
     clean = re.sub(r'\b\d+\s*(?:min|sec|m|s|h|hour)[a-z]*\s*ago\b', ' ', clean, flags=re.IGNORECASE)
-    # 2. Склеиваем числа, если целая и дробная часть разделены переносом строки или пробелом ("11 \n .62" -> "11.62")
     clean = re.sub(r'(\d+)\s*[.,]\s*(\d{2})\b', r'\1.\2', clean)
 
     matches = re.findall(r'\b\d+\.\d{2}\b', clean)
     if matches:
         return matches[0]
 
-    # Резервный поиск любого числа, если сумма целая
     int_matches = re.findall(r'\b\d+\b', clean)
     if int_matches:
-        return int_matches[0]
+        return f"{int(int_matches[0]):.2f}"
     return "???"
 
 
-def trigger_rain(amount: str):
+async def trigger_rain(amount: str):
     global last_alert
     now = time.time()
     if now - last_alert < COOLDOWN:
         return
     last_alert = now
-    msg = f"Rust magic rain: {amount} coins"
+    msg = f"Its raining: {amount}"
     log(f"🔥 НАЧАЛСЯ РЕЙН: {msg}")
-    send_tg(msg)
+    await send_tg(msg)
 
 
 async def check_rustmagic(page):
     global widget_state
     try:
         info = await page.evaluate(r"""() => {
-            // Собираем все блоки в верхней левой части экрана (где находится виджет Rain над чатом), а также по всей странице
             const allElements = Array.from(document.querySelectorAll('div, section, aside, button'));
 
             let rainContainerText = null;
@@ -379,7 +386,6 @@ async def check_rustmagic(page):
 
             for (const el of allElements) {
                 const rect = el.getBoundingClientRect();
-                // Виджет Rain находится слева вверху (x < 360, y < 300)
                 if (rect.left > 360 || rect.top > 300 || rect.width < 50 || rect.height < 20) continue;
 
                 const rawText = (el.innerText || el.textContent || '').trim();
@@ -387,7 +393,6 @@ async def check_rustmagic(page):
 
                 if (low.includes("it's raining") || low.includes("its raining") || low.includes("join rain")) {
                     isRainActive = true;
-                    // Выбираем блок, в котором кроме текста кнопки есть и цифры суммы
                     if (/\d/.test(rawText) && rawText.length < 250) {
                         if (!rainContainerText || rawText.length < rainContainerText.length) {
                             rainContainerText = rawText;
@@ -397,7 +402,6 @@ async def check_rustmagic(page):
             }
 
             if (isRainActive) {
-                // Если нашли кнопку, но цифры в родительском блоке — берем весь верхний блок чата
                 if (!rainContainerText) {
                     const topLeftTexts = allElements
                         .filter(el => {
@@ -415,7 +419,6 @@ async def check_rustmagic(page):
                 };
             }
 
-            // Если рейн не активен — ищем плашку ожидания "Coin Rain"
             for (const el of allElements) {
                 const rect = el.getBoundingClientRect();
                 if (rect.left > 360 || rect.top > 300) continue;
@@ -436,7 +439,8 @@ async def check_rustmagic(page):
         widget_state = info["state"]
         if info["active"]:
             amount = extract_amount(info["text"])
-            trigger_rain(amount)
+            if amount != "???":
+                await trigger_rain(amount)
     except Exception as e:
         widget_state = f"Ошибка: {e}"
 
@@ -463,9 +467,17 @@ async def main():
 
     start_time = time.time()
     async with async_playwright() as p:
+        # Флаги отключают фоновое засыпание вкладки и задержку таймеров в Chromium
         browser = await p.chromium.launch(
             headless=False,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--window-size=1920,1080"]
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--window-size=1920,1080",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding"
+            ]
         )
 
         context_kwargs = {
@@ -488,29 +500,30 @@ async def main():
             log(f"Ошибка загрузки: {e}")
 
         rm_page = get_rustmagic_page(context, main_page)
+        await rm_page.bring_to_front()
         await check_rustmagic(rm_page)
 
         if await is_logged_in(rm_page):
             await send_screen(rm_page, f"✅ Сайт открыт (вход уже выполнен)!\n📊 {widget_state}")
         else:
-            send_tg("🔓 Вход еще не выполнен. Начинаю авторизацию...")
+            await send_tg("🔓 Вход еще не выполнен. Начинаю авторизацию...")
             await start_login_process(context, rm_page)
 
-        loop_count = 0
+        # Быстрый цикл мониторинга (проверка 3 раза в секунду)
+        last_tg_check = 0
         while time.time() - start_time < RUN_DURATION:
             rm_page = get_rustmagic_page(context, main_page)
             await check_rustmagic(rm_page)
 
-            # Если пользователь только что вошел в аккаунт — автоматически сохраняем куки в GitHub
-            if not session_saved_this_run and "rustmagic.com" in rm_page.url:
-                if await is_logged_in(rm_page):
-                    await save_session_to_github(context, notify=True)
-
-            loop_count += 1
-            if loop_count % 2 == 0:
+            now = time.time()
+            if now - last_tg_check >= 2.0:
+                last_tg_check = now
+                if not session_saved_this_run and "rustmagic.com" in rm_page.url:
+                    if await is_logged_in(rm_page):
+                        await save_session_to_github(context, notify=True)
                 await check_telegram_updates(context, main_page)
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         await browser.close()
 
