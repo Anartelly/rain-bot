@@ -14,13 +14,14 @@ BOT_TOKEN = "8935522730:AAH2sDOqtf4kCk_-YWaW1Npz0IDtjgRYqOM"
 SESSION_FILE = "session.json"
 
 RUN_DURATION = 52 * 60  # 52 минуты работы одной смены
-COOLDOWN = 240          # 4 минуты паузы после уведомления о рейне
+COOLDOWN = 210          # 3.5 минуты паузы после уведомления, чтобы не слать дважды за один рейн
 
 last_alert = 0
 widget_state = "Загрузка..."
 CHAT_ID = None
 last_update_id = 0
 auth_stage = "IDLE"
+session_saved_this_run = False
 
 
 def log(msg: str):
@@ -64,8 +65,18 @@ def send_photo_bytes_tg(image_bytes: bytes, caption: str):
 
 
 def get_active_page(context):
-    pages = context.pages
+    """Всегда возвращает актуальную открытую вкладку."""
+    pages = [p for p in context.pages if not p.is_closed()]
     return pages[-1] if pages else None
+
+
+def get_rustmagic_page(context, fallback_page):
+    """Возвращает последнюю вкладку, где открыт rustmagic.com."""
+    pages = [p for p in context.pages if not p.is_closed() and "rustmagic.com" in p.url]
+    if pages:
+        return pages[-1]
+    active = get_active_page(context)
+    return active if active else fallback_page
 
 
 async def fast_screenshot(page) -> bytes:
@@ -85,8 +96,9 @@ async def send_screen(page, caption: str):
         send_photo_bytes_tg(img, caption)
 
 
-async def save_session_to_github(context):
-    """Сохраняет куки входа в репозиторий, чтобы не вводить код каждый час."""
+async def save_session_to_github(context, notify=True):
+    """Сохраняет куки входа в репозиторий, чтобы не вводить код при перезапусках."""
+    global session_saved_this_run
     try:
         await context.storage_state(path=SESSION_FILE)
         subprocess.run(["git", "config", "user.name", "rain-bot"], check=False)
@@ -94,17 +106,20 @@ async def save_session_to_github(context):
         subprocess.run(["git", "add", SESSION_FILE], check=False)
         subprocess.run(["git", "commit", "-m", "Save login session"], check=False)
         subprocess.run(["git", "push"], check=False)
+        session_saved_this_run = True
         log("Сессия успешно сохранена в session.json")
-        send_tg("💾 Сессия сохранена в репозиторий (session.json)!")
+        if notify:
+            send_tg("💾 Сессия аккаунта сохранена в GitHub (session.json)!")
     except Exception as e:
         log(f"Ошибка сохранения сессии: {e}")
 
 
 async def start_login_process(context, main_page):
     global auth_stage
+    page = get_rustmagic_page(context, main_page)
     try:
         send_tg("🔐 Нажимаю кнопку Sign In на сайте...")
-        await main_page.evaluate("""() => {
+        await page.evaluate("""() => {
             const btns = Array.from(document.querySelectorAll('button, a, [role="button"], div'));
             for (const b of btns) {
                 const t = (b.innerText || '').trim().toLowerCase();
@@ -118,7 +133,7 @@ async def start_login_process(context, main_page):
 
         await asyncio.sleep(4)
 
-        await main_page.evaluate("""() => {
+        await page.evaluate("""() => {
             const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"], [role="checkbox"]'));
             checkboxes.forEach(cb => { if (!cb.checked) cb.click(); });
 
@@ -173,7 +188,7 @@ async def submit_credentials(context, username: str, password: str):
             get_active_page(context),
             "📩 Шаг 2: Отправь 5-значный код с почты/Steam:\n"
             "код XXXXX\n\n"
-            "(Либо кликни в ячейку вручную: клик X Y XXXXX)"
+            "(Либо кликни вручную: клик X Y XXXXX)"
         )
     except Exception as e:
         send_tg(f"⚠️ Ошибка ввода логина/пароля: {e}")
@@ -181,12 +196,10 @@ async def submit_credentials(context, username: str, password: str):
 
 
 async def submit_guard_code(context, main_page, code: str):
-    """Вводит код без зависания на скрытых кнопках Steam."""
     global auth_stage
     page = get_active_page(context)
     try:
         send_tg(f"⏳ Печатаю код: {code}...")
-        # Ставим фокус в первое видимое текстовое поле через JS (мгновенно, без таймаутов)
         await page.evaluate("""() => {
             const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="password"]):not([type="checkbox"])'))
                 .filter(el => el.offsetParent !== null);
@@ -200,7 +213,6 @@ async def submit_guard_code(context, main_page, code: str):
 
         await asyncio.sleep(6)
 
-        # Если открылось окно OpenID (кнопка #imageLogin "Войти" в Steam) — жмем через JS без ожидания
         page = get_active_page(context)
         if "steamcommunity.com" in page.url:
             clicked = await page.evaluate("""() => {
@@ -217,10 +229,10 @@ async def submit_guard_code(context, main_page, code: str):
                 await asyncio.sleep(6)
 
         auth_stage = "DONE"
-        await save_session_to_github(context)
+        await save_session_to_github(context, notify=True)
         await send_screen(
             get_active_page(context),
-            "✅ Готово! Проверь по скриншоту, вошел ли бот на сайт."
+            "✅ Вход выполнен и сохранен! Мониторинг Rain работает."
         )
     except Exception as e:
         send_tg(f"⚠️ Ошибка при вводе кода: {e}")
@@ -261,11 +273,9 @@ async def check_telegram_updates(context, main_page):
                 low_text = raw_text.lower()
                 page = get_active_page(context)
 
-                # 1. Начать вход
                 if low_text in ["вход", "войти", "/login", "login"]:
                     await start_login_process(context, main_page)
 
-                # 2. Логин и пароль
                 elif low_text.startswith("логин ") or low_text.startswith("login "):
                     parts = raw_text.split(maxsplit=2)
                     if len(parts) >= 3:
@@ -273,17 +283,14 @@ async def check_telegram_updates(context, main_page):
                     else:
                         send_tg("⚠️ Формат: логин ТВОЙ_ЛОГИН ТВОЙ_ПАРОЛЬ")
 
-                # 3. Код с почты
                 elif low_text.startswith("код ") or low_text.startswith("code "):
                     parts = raw_text.split(maxsplit=1)
                     if len(parts) >= 2:
                         await submit_guard_code(context, main_page, parts[1].strip())
 
-                # 4. Авто-распознавание 5-значного кода
                 elif auth_stage == "WAIT_CODE" and len(raw_text) == 5 and " " not in raw_text:
                     await submit_guard_code(context, main_page, raw_text)
 
-                # 5. Ручной ввод с клавиатуры: "ввод ТЕКСТ"
                 elif low_text.startswith("ввод ") or low_text.startswith("type "):
                     txt = raw_text.split(maxsplit=1)[1]
                     await page.keyboard.type(txt, delay=120)
@@ -292,18 +299,15 @@ async def check_telegram_updates(context, main_page):
                     await asyncio.sleep(4)
                     await send_screen(get_active_page(context), f"⌨️ Введен текст: {txt}")
 
-                # 6. Нажатие Enter
                 elif low_text in ["энтер", "enter"]:
                     await page.keyboard.press("Enter")
                     await asyncio.sleep(4)
                     await send_screen(get_active_page(context), "⌨️ Нажат Enter")
 
-                # 7. Принудительное сохранение сессии
                 elif low_text in ["сохранить", "save"]:
-                    await save_session_to_github(context)
+                    await save_session_to_github(context, notify=True)
                     await send_screen(get_active_page(context), "Экран при сохранении")
 
-                # 8. Клик по координатам (с возможным вводом текста): "клик X Y" или "клик X Y ТЕКСТ"
                 elif low_text.startswith("клик") or low_text.startswith("click"):
                     parts = raw_text.split(maxsplit=3)
                     if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
@@ -319,15 +323,14 @@ async def check_telegram_updates(context, main_page):
                     else:
                         send_tg("⚠️ Формат: клик X Y  или  клик X Y ТЕКСТ")
 
-                # 9. Любое другое сообщение — статус и скриншот
                 else:
                     send_tg(
                         f"🟢 Бот на связи!\n"
                         f"📊 Виджет: {widget_state}\n\n"
-                        f"Ручное управление:\n"
+                        f"Команды:\n"
                         f"• клик X Y — нажать мышкой\n"
                         f"• клик X Y ТЕКСТ — нажать и вписать текст\n"
-                        f"• ввод ТЕКСТ — просто напечатать по буквам + Enter\n"
+                        f"• ввод ТЕКСТ — напечатать по буквам + Enter\n"
                         f"• сохранить — сохранить вход в GitHub"
                     )
                     await send_screen(page, "Текущий экран")
@@ -336,11 +339,20 @@ async def check_telegram_updates(context, main_page):
 
 
 def extract_amount(text: str) -> str:
-    clean = re.sub(r'\b\d{1,2}:\d{2}\b', '', text)
-    clean = re.sub(r'\b\d+\s*(?:min|sec|m|s|h|hour)[a-z]*\s*ago\b', '', clean, flags=re.IGNORECASE)
-    matches = re.findall(r'\b\d+[.,]\d{2}\b', clean)
+    # 1. Убираем таймер вида "02:17" и строки "27 min ago"
+    clean = re.sub(r'\b\d{1,2}\s*:\s*\d{2}\b', ' ', text)
+    clean = re.sub(r'\b\d+\s*(?:min|sec|m|s|h|hour)[a-z]*\s*ago\b', ' ', clean, flags=re.IGNORECASE)
+    # 2. Склеиваем числа, если целая и дробная часть разделены переносом строки или пробелом ("11 \n .62" -> "11.62")
+    clean = re.sub(r'(\d+)\s*[.,]\s*(\d{2})\b', r'\1.\2', clean)
+
+    matches = re.findall(r'\b\d+\.\d{2}\b', clean)
     if matches:
-        return matches[0].replace(",", ".")
+        return matches[0]
+
+    # Резервный поиск любого числа, если сумма целая
+    int_matches = re.findall(r'\b\d+\b', clean)
+    if int_matches:
+        return int_matches[0]
     return "???"
 
 
@@ -358,47 +370,64 @@ def trigger_rain(amount: str):
 async def check_rustmagic(page):
     global widget_state
     try:
-        info = await page.evaluate("""() => {
-            const blocks = Array.from(document.querySelectorAll('div, section, aside'));
+        info = await page.evaluate(r"""() => {
+            // Собираем все блоки в верхней левой части экрана (где находится виджет Rain над чатом), а также по всей странице
+            const allElements = Array.from(document.querySelectorAll('div, section, aside, button'));
 
-            let activeMatches = [];
-            for (const el of blocks) {
-                const t = (el.innerText || '').trim();
-                const low = t.toLowerCase();
-                if (t.length > 5 && t.length < 180) {
-                    const isRainActive = low.includes("it's raining") || low.includes("its raining") || low.includes("join rain");
-                    if (isRainActive && /\\d+[.,]\\d{2}/.test(t)) {
-                        activeMatches.push(t);
+            let rainContainerText = null;
+            let isRainActive = false;
+
+            for (const el of allElements) {
+                const rect = el.getBoundingClientRect();
+                // Виджет Rain находится слева вверху (x < 360, y < 300)
+                if (rect.left > 360 || rect.top > 300 || rect.width < 50 || rect.height < 20) continue;
+
+                const rawText = (el.innerText || el.textContent || '').trim();
+                const low = rawText.toLowerCase().replace(/’/g, "'");
+
+                if (low.includes("it's raining") || low.includes("its raining") || low.includes("join rain")) {
+                    isRainActive = true;
+                    // Выбираем блок, в котором кроме текста кнопки есть и цифры суммы
+                    if (/\d/.test(rawText) && rawText.length < 250) {
+                        if (!rainContainerText || rawText.length < rainContainerText.length) {
+                            rainContainerText = rawText;
+                        }
                     }
                 }
             }
 
-            if (activeMatches.length > 0) {
-                activeMatches.sort((a, b) => a.length - b.length);
-                const best = activeMatches[0];
-                return {
-                    state: "🔥 ИДЕТ РЕЙН: " + best.replace(/\\n+/g, ' | '),
-                    active: true,
-                    text: best
-                };
-            }
-
-            let idleMatches = [];
-            for (const el of blocks) {
-                const t = (el.innerText || '').trim();
-                const low = t.toLowerCase();
-                if (t.length > 5 && t.length < 180 && low.includes("coin rain")) {
-                    idleMatches.push(t);
+            if (isRainActive) {
+                // Если нашли кнопку, но цифры в родительском блоке — берем весь верхний блок чата
+                if (!rainContainerText) {
+                    const topLeftTexts = allElements
+                        .filter(el => {
+                            const r = el.getBoundingClientRect();
+                            return r.left < 320 && r.top >= 50 && r.top < 250 && r.height > 50 && r.height < 200;
+                        })
+                        .map(el => (el.innerText || el.textContent || '').trim())
+                        .filter(t => t.length > 5 && t.length < 300);
+                    rainContainerText = topLeftTexts[0] || "It's Raining!";
                 }
+                return {
+                    state: "🔥 ИДЕТ РЕЙН: " + rainContainerText.replace(/\s+/g, ' '),
+                    active: true,
+                    text: rainContainerText
+                };
             }
 
-            if (idleMatches.length > 0) {
-                idleMatches.sort((a, b) => a.length - b.length);
-                return {
-                    state: "Ожидание: " + idleMatches[0].replace(/\\n+/g, ' | '),
-                    active: false,
-                    text: idleMatches[0]
-                };
+            // Если рейн не активен — ищем плашку ожидания "Coin Rain"
+            for (const el of allElements) {
+                const rect = el.getBoundingClientRect();
+                if (rect.left > 360 || rect.top > 300) continue;
+                const t = (el.innerText || el.textContent || '').trim();
+                const low = t.toLowerCase();
+                if (t.length > 5 && t.length < 200 && low.includes("coin rain")) {
+                    return {
+                        state: "Ожидание: " + t.replace(/\s+/g, ' '),
+                        active: false,
+                        text: t
+                    };
+                }
             }
 
             return { state: "Виджет не виден на экране", active: false, text: "" };
@@ -414,16 +443,21 @@ async def check_rustmagic(page):
 
 async def is_logged_in(page) -> bool:
     try:
-        has_sign_in = await page.evaluate("""() => {
+        return await page.evaluate("""() => {
+            const bodyText = (document.body.innerText || '').toLowerCase();
+            if (bodyText.includes('log out') || bodyText.includes('welcome back') || bodyText.includes('+ deposit')) {
+                return true;
+            }
             const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-            return btns.some(b => (b.innerText || '').trim().toLowerCase() === 'sign in');
+            const hasSignIn = btns.some(b => (b.innerText || '').trim().toLowerCase() === 'sign in');
+            return !hasSignIn;
         }""")
-        return not has_sign_in
     except Exception:
         return False
 
 
 async def main():
+    global session_saved_this_run
     init_chat_id()
     log(f"Запуск мониторинга RustMagic. CHAT_ID: {CHAT_ID}")
 
@@ -441,32 +475,40 @@ async def main():
         if os.path.exists(SESSION_FILE):
             log("Загружаю сохраненную сессию из session.json...")
             context_kwargs["storage_state"] = SESSION_FILE
+            session_saved_this_run = True
 
         context = await browser.new_context(**context_kwargs)
-        page = await context.new_page()
+        main_page = await context.new_page()
 
         try:
             log("Открываю https://rustmagic.com...")
-            await page.goto("https://rustmagic.com", wait_until="domcontentloaded", timeout=45000)
+            await main_page.goto("https://rustmagic.com", wait_until="domcontentloaded", timeout=45000)
             await asyncio.sleep(10)
         except Exception as e:
             log(f"Ошибка загрузки: {e}")
 
-        await check_rustmagic(page)
+        rm_page = get_rustmagic_page(context, main_page)
+        await check_rustmagic(rm_page)
 
-        if await is_logged_in(page):
-            await send_screen(page, f"✅ Сайт открыт (вход уже выполнен)!\n📊 {widget_state}")
+        if await is_logged_in(rm_page):
+            await send_screen(rm_page, f"✅ Сайт открыт (вход уже выполнен)!\n📊 {widget_state}")
         else:
             send_tg("🔓 Вход еще не выполнен. Начинаю авторизацию...")
-            await start_login_process(context, page)
+            await start_login_process(context, rm_page)
 
         loop_count = 0
         while time.time() - start_time < RUN_DURATION:
-            await check_rustmagic(page)
+            rm_page = get_rustmagic_page(context, main_page)
+            await check_rustmagic(rm_page)
+
+            # Если пользователь только что вошел в аккаунт — автоматически сохраняем куки в GitHub
+            if not session_saved_this_run and "rustmagic.com" in rm_page.url:
+                if await is_logged_in(rm_page):
+                    await save_session_to_github(context, notify=True)
 
             loop_count += 1
             if loop_count % 2 == 0:
-                await check_telegram_updates(context, page)
+                await check_telegram_updates(context, main_page)
 
             await asyncio.sleep(1)
 
