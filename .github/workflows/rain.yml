@@ -5,9 +5,6 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 concurrency:
   group: rain-monitor
   cancel-in-progress: false
@@ -31,4 +28,6 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Run Monitor
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python monitor.py
